@@ -136,6 +136,12 @@ def tree():
         "notebooks/03_redundancy_ablation.ipynb",
         "tests/test_step4.py",
         "tools/preflight_step4.py",
+        # Extensions (protocol v2) + scripting
+        "routerguard/merge.py",
+        "routerguard/pipeline.py",
+        "routerguard/cli.py",
+        "tests/test_extensions.py",
+        "tests/test_pipeline.py",
         # Write-up
         "README.md",
     ]

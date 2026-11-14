@@ -61,11 +61,13 @@ def experts_per_layer(model: torch.nn.Module) -> dict[int, int]:
 # ------------------------------------------------------------------- keep sets
 
 
-def keeps_from_scores(scores: dict[int, torch.Tensor], ratio: float) -> dict[int, list[int]]:
+def keeps_from_scores(scores: dict[int, torch.Tensor], ratio: float | dict[int, float]) -> dict[int, list[int]]:
+    """``ratio`` may be a single fraction or a per-layer mapping {layer: ratio}."""
     keeps: dict[int, list[int]] = {}
     for layer, layer_scores in scores.items():
+        layer_ratio = ratio[layer] if isinstance(ratio, dict) else ratio
         n = int(layer_scores.numel())
-        keeps[int(layer)] = top_k_indices(layer_scores, num_keep(n, ratio))
+        keeps[int(layer)] = top_k_indices(layer_scores, num_keep(n, layer_ratio))
     return keeps
 
 
@@ -80,7 +82,7 @@ def random_keeps(experts: dict[int, int], ratio: float, seed: int = 0) -> dict[i
 def keeps_for(
     model: torch.nn.Module,
     kind: str,
-    ratio: float,
+    ratio: float | dict[int, float],
     per_layer_counts: dict[int, Sequence[int]] | None = None,
     seed: int = 0,
     scores: dict[int, torch.Tensor] | None = None,
@@ -174,7 +176,7 @@ def greedy_redundant_keeps(
 
 def redundancy_keeps(
     sim_per_layer: dict[int, Any],
-    ratio: float,
+    ratio: float | dict[int, float],
     per_layer_counts: dict[int, Sequence[int]] | None = None,
     utilization_weight: float = 0.25,
     max_steps: int | None = None,
@@ -182,13 +184,98 @@ def redundancy_keeps(
     keeps: dict[int, list[int]] = {}
     infos: dict[int, dict[str, Any]] = {}
     for layer in sorted(sim_per_layer):
+        layer_ratio = ratio[layer] if isinstance(ratio, dict) else ratio
         util = None
         if per_layer_counts is not None and layer in per_layer_counts:
             util = per_layer_counts[layer]
         keeps[int(layer)], infos[int(layer)] = greedy_redundant_keeps(
-            sim_per_layer[layer], ratio, util, utilization_weight, max_steps
+            sim_per_layer[layer], layer_ratio, util, utilization_weight, max_steps
         )
     return keeps, infos
+
+
+# ------------------------------------------------------- layer-wise removal budgets
+
+
+def layer_redundancy(sim: Any) -> float:
+    """Mean off-diagonal cosine of one layer's similarity matrix.
+
+    This is the per-layer quantity the layer-wise budget allocates by: a layer
+    whose experts are all close to each other can lose more of them.
+    """
+    matrix = torch.as_tensor(np.asarray(sim, dtype=np.float32))
+    n = matrix.shape[0]
+    if n < 2:
+        return 0.0
+    mask = ~torch.eye(n, dtype=torch.bool)
+    return float(matrix[mask].mean())
+
+
+def layer_wise_ratios(
+    sim_per_layer: dict[int, Any],
+    total_ratio: float,
+    max_layer_ratio: float | None = None,
+) -> dict[int, float]:
+    """Allocate removals across layers in proportion to measured redundancy.
+
+    Instead of a uniform ratio everywhere, the *total* removal budget
+    (``round(total_ratio * total_experts)``) is distributed by largest-remainder
+    with weights proportional to each layer's mean off-diagonal similarity (shifted
+    so the least redundant layer still has a small positive weight; identical
+    layers split the budget uniformly). Constraints, enforced in order:
+
+    * every layer keeps at least one expert;
+    * ``max_layer_ratio`` (optional) caps how much any single layer loses;
+    * the total number of removals is conserved exactly — whatever a clamp frees
+      up is re-allocated to layers that still have slack, in descending redundancy.
+
+    Deterministic: ties break by higher redundancy, then lower layer index.
+    """
+    if not 0.0 <= total_ratio < 1.0:
+        raise ValueError(f"total_ratio must be in [0, 1), got {total_ratio}")
+    layers = sorted(sim_per_layer)
+    sizes = {layer: int(np.asarray(sim_per_layer[layer]).shape[0]) for layer in layers}
+    total_experts = sum(sizes.values())
+    removals = {layer: 0 for layer in layers}
+    if total_experts <= len(layers):
+        return {layer: 0.0 for layer in layers}
+    budget = min(int(round(total_ratio * total_experts)), total_experts - len(layers))
+    if budget <= 0:
+        return {layer: 0.0 for layer in layers}
+
+    red = {layer: layer_redundancy(sim_per_layer[layer]) for layer in layers}
+    lowest = min(red.values())
+    spread = max(red.values()) - lowest
+    # Shift so the least redundant layer keeps a small positive weight; without the
+    # shift a single zero-redundancy layer would zero out the whole allocation.
+    eps = 1e-6 * max(spread, 1.0)
+    weights = {layer: red[layer] - lowest + eps for layer in layers}
+    weight_sum = sum(weights.values())
+
+    # Largest-remainder allocation for exact budget conservation.
+    shares = {layer: budget * weights[layer] / weight_sum for layer in layers}
+    for layer in layers:
+        cap = sizes[layer] - 1
+        if max_layer_ratio is not None:
+            cap = min(cap, int(max_layer_ratio * sizes[layer]))
+        removals[layer] = min(int(shares[layer]), cap)
+    remainder = budget - sum(removals.values())
+    order = sorted(layers, key=lambda layer: (-red[layer], layer))
+    while remainder > 0:
+        progressed = False
+        for layer in order:
+            if remainder <= 0:
+                break
+            cap = sizes[layer] - 1
+            if max_layer_ratio is not None:
+                cap = min(cap, int(max_layer_ratio * sizes[layer]))
+            if removals[layer] < cap:
+                removals[layer] += 1
+                remainder -= 1
+                progressed = True
+        if not progressed:  # every layer is at its cap; budget was infeasible
+            break
+    return {layer: removals[layer] / sizes[layer] for layer in layers}
 
 
 # --------------------------------------------------------------------- apply

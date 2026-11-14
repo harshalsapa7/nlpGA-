@@ -3,7 +3,12 @@
 # FROZEN: numbers here are fixed before any results are seen. Do not edit after
 # looking at numbers; if a change is unavoidable, bump protocol_version, record
 # the reason in the run's metrics.json, and report both versions.
-protocol_version: 1
+#
+# v2 (additive only, recorded before any Step 3/4 real-model result existed):
+#   * balance.update_mode  — the adaptive update variant (sign stays the default)
+#   * extensions           — opt-in arms: post-prune refit, merge, layer-wise budget
+# Every registered number, gate, and the 2x2 ablation are unchanged from v1.
+protocol_version: 2
 frozen: true
 
 models:
@@ -61,6 +66,8 @@ balance:
   default_u: 0.001
   iters: 1                         # passes over the calibration set
   update: b_i += u * sign(c_bar - c_i)   # per-expert router bias, frozen after calibration
+  update_mode: sign                # "sign" (registered) | "proportional" (gap-proportional;
+                                   # step vanishes as balance converges -> no overshoot)
   selection_only: true             # top-k on (s + b); mixing weights from unbiased s
 
 similarity:
@@ -94,3 +101,14 @@ design:
   fallback: >
     If the redundancy metric does not beat frequency pruning, the controlled
     negative result IS the deliverable, stated up front.
+
+# v2 extension arms (additive; the registered 2x2 above is untouched).
+# refit: second bias calibration on the pruned model — nearly free, run by default.
+# merge: averaging redundant pairs — needs UNQUANTIZED experts (bf16 load), so it is
+#        opt-in and refused loudly on 8/4-bit checkpoints (see merge.py).
+# layer_wise_budget: distribute the removal budget across layers by measured
+#        redundancy instead of a uniform ratio (redundancy arm only).
+extensions:
+  post_prune_refit: true
+  merge_instead_of_remove: false
+  layer_wise_budget: false

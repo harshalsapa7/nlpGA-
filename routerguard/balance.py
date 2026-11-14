@@ -5,11 +5,18 @@ Method, stated exactly
 Per layer and per routed expert we keep a bias ``b_i`` (float32). Selection is
 ``topk(s + b)``; the mixing weights stay the *unbiased* ones (see ``moe.moe_forward``).
 After each calibration batch, with ``c_i`` the cumulative load and ``c_bar`` its mean,
+``mode`` picks one of two updates (``protocol.yaml: balance.update_mode``):
 
-    b_i <- b_i + u * sign(c_bar - c_i)
+    sign:          b_i <- b_i + u * sign(c_bar - c_i)          # the registered protocol
+    proportional:  b_i <- b_i + u * (c_bar - c_i) / (c_bar + eps)
 
-where ``u`` comes from ``protocol.yaml`` (``balance.default_u``). Weights never change
-and nothing is trained; the biases are fitted once on calibration data and frozen.
+``sign`` is the DeepSeek update and the frozen default. ``proportional`` is the
+adaptive variant listed under possible improvements: the step is proportional to the
+*relative* load gap, so it is bounded by ``u`` per batch but shrinks toward zero as
+the load converges. That removes the overshoot boundary documented in the README
+(``u >= 0.02`` makes Gini *worse* under sign updates) at the cost of converging more
+slowly when an expert is far from target. Both modes never touch weights; the biases
+are fitted once on calibration data and frozen.
 
 Guards (both numeric, both pre-registered)
 ------------------------------------------
@@ -25,7 +32,7 @@ import copy
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import torch
 
@@ -34,6 +41,36 @@ from . import moe, stats
 
 
 # --------------------------------------------------------------------- primitives
+
+
+def bias_delta(
+    cumulative: torch.Tensor, u: float, mode: str = "sign"
+) -> torch.Tensor:
+    """Per-expert bias increment for one calibration batch.
+
+    ``cumulative`` is the float64 per-expert load accumulated so far. Returns a
+    float32 tensor meant to be added to the bias. Both modes are bounded by ``u``
+    per batch; they differ in what happens near balance:
+
+    * ``sign`` steps at full magnitude ``u`` forever, so ``u * n_updates`` grows
+      linearly with the number of batches — this is the documented overshoot risk.
+    * ``proportional`` steps by ``u * (c_bar - c_i) / (c_bar + eps)``, the relative
+      gap, which vanishes as the load converges (a dead expert still gets the full
+      ``u``, an expert 2x over-loaded gets ``-u``, one 1% off gets ~0.01u).
+    """
+    if u <= 0:
+        raise ValueError(f"u must be > 0, got {u}")
+    cumulative = torch.as_tensor(cumulative, dtype=torch.float64)
+    target = cumulative.mean()
+    if mode == "sign":
+        delta = torch.sign(target - cumulative)
+    elif mode == "proportional":
+        delta = (target - cumulative) / (target + 1e-12)
+    else:
+        raise ValueError(
+            f"unknown balance update mode {mode!r} (expected 'sign' or 'proportional')"
+        )
+    return (u * delta).to(torch.float32)
 
 
 def zero_biases(model: torch.nn.Module) -> dict[int, torch.Tensor]:
@@ -53,6 +90,30 @@ def biases_to_cpu(biases: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
 
 def biases_to(biases: dict[int, torch.Tensor], device: str | torch.device) -> dict[int, torch.Tensor]:
     return {int(k): v.detach().float().to(device).clone() for k, v in biases.items()}
+
+
+def slice_biases(
+    biases: dict[int, torch.Tensor], keeps: dict[int, Sequence[int]]
+) -> dict[int, torch.Tensor]:
+    """Biases for an already-pruned model.
+
+    ``prune_block_inplace`` keeps the surviving experts in ascending original-index
+    order, so gate row ``j`` of the pruned model corresponds to ``keep[j]`` of the
+    original. A bias fitted before pruning is indexed in the original space, so it
+    must be re-indexed the same way before it can be applied to the pruned gate.
+    """
+    out: dict[int, torch.Tensor] = {}
+    for layer, bias in biases.items():
+        keep = keeps.get(int(layer))
+        if keep is None:
+            out[int(layer)] = bias
+            continue
+        index = torch.as_tensor(sorted(int(i) for i in keep), dtype=torch.long)
+        if index.numel() != bias.numel():
+            out[int(layer)] = bias.detach().float().index_select(0, index).clone()
+        else:
+            out[int(layer)] = bias.detach().float().clone()
+    return out
 
 
 @torch.no_grad()
@@ -89,11 +150,14 @@ def fit_biases(
     device: str | None = None,
     max_tokens: int | None = None,
     progress: bool = True,
+    mode: str = "sign",
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Fit per-expert router biases on calibration data. No weight updates.
 
     The update runs once per batch (online LFB): forward with the current biases,
-    accumulate load, then nudge each bias by ``u * sign(mean(cum) - cum)``.
+    accumulate load, then nudge each bias by ``bias_delta(cum, u, mode)``.
+    ``mode`` is ``"sign"`` (the registered protocol) or ``"proportional"``
+    (gap-proportional; see the module docstring).
     """
     if u <= 0:
         raise ValueError(f"u must be > 0, got {u}")
@@ -115,20 +179,21 @@ def fit_biases(
             per_layer = patch.recorder.per_layer_counts()
             for layer, counts in per_layer.items():
                 cumulative[layer] += counts.to(torch.float64)
-                target = cumulative[layer].mean()
-                # sign(c_bar - c_i): push under-loaded experts up, over-loaded down.
-                biases[layer] += u * torch.sign(target - cumulative[layer].to(torch.float32))
+                # sign(c_bar - c_i), or its gap-proportional variant: push under-loaded
+                # experts up, over-loaded down. Mixing weights stay unbiased either way.
+                biases[layer] += bias_delta(cumulative[layer], u, mode)
             updates += 1
             seen += int(batch.numel())
             if progress and (index % 10 == 0):
                 print(
                     f"  [balance] epoch {epoch} batch {index + 1}/{n_batches} "
-                    f"u={u} tokens={seen}",
+                    f"u={u} mode={mode} tokens={seen}",
                     flush=True,
                 )
 
     info = {
         "u": float(u),
+        "mode": str(mode),
         "iters": int(iters),
         "updates": updates,
         "tokens_seen": seen,
@@ -158,6 +223,7 @@ class BalanceResult:
     eval_before: dict[str, Any]
     eval_after: dict[str, Any]
     fit_info: dict[str, Any] = field(default_factory=dict)
+    mode: str = "sign"
 
     # -- derived numbers -------------------------------------------------------
     @property
@@ -228,6 +294,7 @@ class BalanceResult:
         return {
             "u": self.u,
             "iters": self.iters,
+            "update_mode": self.mode,
             "gini_calib": {"before": self.calib_before["gini_mean"], "after": self.calib_after["gini_mean"]},
             "gini_eval": {"before": self.eval_before["gini_mean"], "after": self.eval_after["gini_mean"]},
             "gini_gain_calib": self.gini_gain_calib,
@@ -262,6 +329,7 @@ class BalanceResult:
             {
                 "u": self.u,
                 "iters": self.iters,
+                "update_mode": self.mode,
                 "biases": biases_to_cpu(self.biases),
                 "summary": self.summary(),
             },
@@ -285,17 +353,23 @@ def evaluate_balance(
     max_tokens: int | None = None,
     device: str = "cuda",
     progress: bool = True,
+    mode: str | None = None,
 ) -> BalanceResult:
-    """Baseline stats -> fit biases on calib -> balanced stats, on calib AND eval."""
+    """Baseline stats -> fit biases on calib -> balanced stats, on calib AND eval.
+
+    Works on the unpruned model (Step 3) and on an already-pruned model (the
+    post-pruning refit arm); the guards are computed identically in both cases.
+    """
     cfg = protocol.get("balance", {})
     u = float(u if u is not None else cfg.get("default_u", 0.001))
     iters = int(iters if iters is not None else cfg.get("iters", 1))
+    mode = str(mode if mode is not None else cfg.get("update_mode", "sign"))
 
     calib_before = measure_model(model, calib_ids, None, batch_size, device, max_tokens)
     eval_before = measure_model(model, eval_ids, None, batch_size, device, max_tokens)
     biases, fit_info = fit_biases(
         model, calib_ids, u=u, iters=iters, batch_size=batch_size,
-        device=device, max_tokens=max_tokens, progress=progress,
+        device=device, max_tokens=max_tokens, progress=progress, mode=mode,
     )
     calib_after = measure_model(model, calib_ids, biases, batch_size, device, max_tokens)
     eval_after = measure_model(model, eval_ids, biases, batch_size, device, max_tokens)
@@ -309,6 +383,7 @@ def evaluate_balance(
         eval_before=eval_before,
         eval_after=eval_after,
         fit_info=fit_info,
+        mode=mode,
     )
     if progress:
         for warning in result.warnings():

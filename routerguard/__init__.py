@@ -16,6 +16,9 @@ __all__ = [
     "balance",
     "similarity",
     "prune",
+    "merge",
     "eval",
     "run",
+    "pipeline",
+    "cli",
 ]

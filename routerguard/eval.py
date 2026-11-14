@@ -150,6 +150,9 @@ def mmlu_accuracy(
         "accuracy": correct / len(prompts),
         "n_questions": len(prompts),
         "n_correct": correct,
+        # Wilson 95% band: MMLU at ~500 questions has real sampling noise; report it
+        # instead of a bare point estimate (README: "report MMLU noise explicitly").
+        "accuracy_ci95": list(wilson_interval(correct, len(prompts))),
         "n_shot": int(prompts[0].get("n_shot", 0)),
         "per_subject": {
             subject: {"accuracy": sum(v) / len(v), "n": len(v)}
@@ -159,7 +162,52 @@ def mmlu_accuracy(
     }
 
 
-# ---------------------------------------------------------------------- memory
+# ------------------------------------------------------------------------ memory
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval on a binomial proportion (MMLU accuracy noise band).
+
+    Preferred over the normal approximation because accuracies near 0/1 and small
+    n (500 questions) make the Wald interval dishonest.
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    p = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n)) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def checkpoint_bytes(model) -> dict[str, Any]:
+    """Bytes the model's parameters actually occupy as stored tensors.
+
+    This is the on-disk/checkpoint proxy the memory headline should be based on —
+    allocator counters move with caches and fragments, while this counts what the
+    weights themselves take. Quantized (bitsandbytes) weights are already packed:
+    their storage is a uint8 tensor whose ``numel`` counts bytes, so
+    ``numel * element_size`` is the packed size (quant-scale metadata, a small
+    per-tensor overhead, is not counted — noted here so nobody over-claims).
+    """
+    total = 0
+    tensors = 0
+    quantized = 0
+    for param in model.state_dict().values():
+        if not torch.is_tensor(param):
+            continue
+        tensors += 1
+        total += int(param.numel()) * int(param.element_size())
+        if hasattr(param, "quant_state"):
+            quantized += 1
+    return {
+        "bytes": total,
+        "gb": round(total / 1024**3, 3),
+        "tensors": tensors,
+        "quantized_tensors": quantized,
+        "note": "packed quantized weights counted as stored bytes; quant-scale metadata excluded",
+    }
 
 
 def memory_snapshot() -> dict[str, float]:
@@ -175,15 +223,23 @@ def memory_snapshot() -> dict[str, float]:
 
 
 def param_report(model, precision: str = "bf16") -> dict[str, Any]:
-    """Parameter accounting; the estimate is a labeling aid, not the headline."""
+    """Parameter accounting; the estimate is a labeling aid, not the headline.
+
+    ``checkpoint_bytes`` is the stored-bytes measurement the headline memory claim
+    uses; ``estimated_gb`` is the params-x-bytes-per-param approximation for the
+    declared precision and is kept for comparison against the run log.
+    """
     total = sum(p.numel() for p in model.parameters())
     bytes_per = BYTES_PER_PARAM.get(precision)
+    stored = checkpoint_bytes(model)
     return {
         "params_total": int(total),
         "params_billions": round(total / 1e9, 3),
         "precision": precision,
         "bytes_per_param": bytes_per,
         "estimated_gb": round(total * bytes_per / 1024**3, 3) if bytes_per else None,
+        "checkpoint_bytes": stored["bytes"],
+        "checkpoint_gb": stored["gb"],
     }
 
 
