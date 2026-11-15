@@ -178,7 +178,10 @@ def fit_biases(
                 model(input_ids=batch, use_cache=False)
             per_layer = patch.recorder.per_layer_counts()
             for layer, counts in per_layer.items():
-                cumulative[layer] += counts.to(torch.float64)
+                # The recorder stores counts on CPU; biases follow each gate's device.
+                cumulative[layer] += counts.to(
+                    device=cumulative[layer].device, dtype=cumulative[layer].dtype,
+                )
                 # sign(c_bar - c_i), or its gap-proportional variant: push under-loaded
                 # experts up, over-loaded down. Mixing weights stay unbiased either way.
                 biases[layer] += bias_delta(cumulative[layer], u, mode)

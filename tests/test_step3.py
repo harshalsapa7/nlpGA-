@@ -5,6 +5,7 @@ point is that these functions are *executed* and checked against an independent
 reference, not merely imported.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,58 @@ def test_fit_biases_rejects_non_positive_u(flavor):
     model = build_model(flavor)
     with pytest.raises(ValueError, match="u must be > 0"):
         balance.fit_biases(model, make_ids(), u=0.0)
+
+
+def test_fit_biases_moves_cpu_counts_to_cuda_accumulator(monkeypatch):
+    """Reproduce Kaggle's device boundary without requiring a CUDA runtime."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    class UpdateReached(Exception):
+        pass
+
+    def check_update(cumulative, u, mode):
+        assert cumulative.device == torch.device("cuda:0")
+        assert cumulative.dtype == torch.float64
+        # Fake tensors have no values; stop before fit_biases serializes them.
+        raise UpdateReached
+
+    with FakeTensorMode():
+        biases = {0: torch.zeros(8, device="cuda:0")}
+        counts = {0: torch.ones(8, dtype=torch.int64, device="cpu")}
+        patch = SimpleNamespace(
+            recorder=SimpleNamespace(per_layer_counts=lambda: counts),
+        )
+        monkeypatch.setattr(balance, "zero_biases", lambda model: biases)
+        monkeypatch.setattr(moe, "MoePatch", lambda *args, **kwargs: nullcontext(patch))
+        monkeypatch.setattr(balance, "bias_delta", check_update)
+        with pytest.raises(UpdateReached):
+            balance.fit_biases(
+                lambda **kwargs: None, torch.zeros(1, 4, dtype=torch.long),
+                batch_size=1, progress=False,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", ["sign", "proportional"])
+def test_fit_biases_cuda_with_cpu_recorder(flavor, mode):
+    model = _skewed_model(flavor).to(device="cuda:0", dtype=torch.float16)
+    ids = make_ids(batch=4, seq=16)
+    with torch.no_grad(), moe.MoePatch(model, record=True) as patch:
+        model(input_ids=ids[:1].to("cuda:0"), use_cache=False)
+    assert all(c.device.type == "cpu" for c in patch.recorder.per_layer_counts().values())
+
+    biases, info = balance.fit_biases(
+        model, ids, batch_size=1, device="cuda:0", progress=False, mode=mode,
+    )
+    assert info["updates"] == 4
+    assert info["tokens_seen"] == ids.numel()
+    for layer, bias in biases.items():
+        assert bias.device == torch.device("cuda:0")
+        assert bias.dtype == torch.float32
+        assert torch.isfinite(bias).all().item()
+        assert sum(info["final_cumulative_load"][layer]) == (
+            ids.numel() * model.config.num_experts_per_tok
+        )
 
 
 def test_zero_bias_measurement_matches_baseline(flavor):

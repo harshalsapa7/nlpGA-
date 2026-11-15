@@ -6,6 +6,7 @@ and writes a complete, parseable run directory.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -150,6 +151,54 @@ def test_run_pipeline_refit_can_be_disabled(tmp_path):
     assert state["refit"] is None and state["refit_ppl"] is None
     run_dir = tmp_path / "results" / state["run_id"]
     assert not (run_dir / "metrics" / "balance_after_prune.json").exists()
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda:0", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="requires CUDA",
+    )),
+])
+def test_kaggle_smoke_settings_complete_pipeline(tmp_path, device):
+    """Actual notebook settings, real tiny OLMoE; no checkpoint/data downloads.
+
+    The injected model is unquantized. Kaggle's preflight separately tests int8.
+    """
+    notebook = json.loads(
+        (Path(__file__).resolve().parents[1] / "notebooks/04_kaggle_safe_run.ipynb").read_text()
+    )
+    source = next(cell["source"] for cell in notebook["cells"] if cell["id"] == "experiment-helper")
+    namespace = {"RESULTS_DIR": tmp_path / "results"}
+    exec("".join(source), namespace)
+    settings = {**namespace["BASE_SETTINGS"], **namespace["SMOKE_SETTINGS"]}
+
+    def loader():
+        model = build_model("olmoe").to(
+            device=device, dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+        )
+        info = _Info()
+        info.precision = "fp16" if device.startswith("cuda") else "fp32"
+        return model, SimpleNamespace(name_or_path="tiny"), info
+
+    splits = {}
+    for name, section, seed in (("calib", "calibration", 3), ("eval", "eval", 4)):
+        config = settings["overrides"][section]
+        splits[name] = TokenSplit(
+            name, make_ids(batch=config["n_seqs"], seq=config["seq_len"], seed=seed),
+            {"dataset": "tiny", "config": "tiny", "split": name, "token_offset": 0},
+        )
+    settings.update(device=device, loader=loader, splits=splits, progress=False)
+    state = run_pipeline(PipelineSpec(**settings))
+    run_dir = Path(state["run_dir"])
+    summary = json.loads((run_dir / "metrics/summary.json").read_text())
+    ablation = json.loads((run_dir / "metrics/ablation_2x2.json").read_text())
+    assert len(ablation["cells"]) == 6  # 2 router states x 3 pruning methods
+    assert summary["baseline_ppl"] > 0
+    assert summary["pruned_ppl_balanced"] > 0
+    assert summary["checkpoint_bytes_saved"] > 0
+    assert summary["refit"] is None
+    assert summary["merge"] is None
+    assert (run_dir / "balance_biases.pt").is_file()
 
 
 # ------------------------------------------------------------------ stage commands
