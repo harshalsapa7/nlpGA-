@@ -171,7 +171,37 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIn("OlmoeForCausalLM(config)", self.cells["preflight"])
         self.assertIn("biases, fit = fit_biases(", self.cells["preflight"])
         self.assertIn("device='cuda:0'", self.cells["preflight"])
+        self.assertIn("state = run_pipeline(PipelineSpec(", self.cells["preflight"])
+        self.assertIn("TokenSplit('synthetic_calib'", self.cells["preflight"])
         self.assertNotIn("from_pretrained", self.cells["preflight"])
+
+    def test_complete_tiny_preflight_program_offline_on_cpu(self):
+        """Execute the notebook's actual synthetic pipeline, not a parallel copy."""
+        import torch
+        from transformers import OlmoeConfig, OlmoeForCausalLM
+        from routerguard.balance import fit_biases
+        from routerguard.data import TokenSplit
+        from routerguard.pipeline import PipelineSpec, run_pipeline
+
+        tree = ast.parse(self.cells["preflight"])
+        program = next(
+            node.value.value for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "preflight" for t in node.targets)
+        )
+        # Only replace hardware/precision, not the pipeline or its data/settings.
+        program = program[program.index("# Exercise the complete tiny pipeline"):]
+        program = program.replace("cuda:0", "cpu").replace("float16", "float32").replace("'fp16'", "'fp32'")
+        namespace = {
+            "torch": torch, "tempfile": tempfile, "SimpleNamespace": SimpleNamespace,
+            "OlmoeConfig": OlmoeConfig, "OlmoeForCausalLM": OlmoeForCausalLM,
+            "fit_biases": fit_biases, "TokenSplit": TokenSplit,
+            "PipelineSpec": PipelineSpec, "run_pipeline": run_pipeline,
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(program, namespace)
+        self.assertGreater(namespace["state"]["checkpoint_bytes_saved"], 0)
+        self.assertEqual(namespace["fit"]["updates"], 2)
 
     def test_experiment_gates(self):
         # Later cells remain safe if a user manually skips over a failed cell.

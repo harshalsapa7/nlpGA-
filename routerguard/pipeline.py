@@ -213,7 +213,7 @@ def _similarity_under_bias(
     sim_unbalanced = rgsim.build_similarity(
         model, calib_ids, run.dir / "sim_unbalanced",
         max_tokens_per_layer=spec.max_tokens_per_layer or 100_000,
-        batch_size=spec.similarity_batch_size, device=None,
+        batch_size=spec.similarity_batch_size, device=spec.device,
         progress=spec.progress,
     ).matrices
 
@@ -223,7 +223,7 @@ def _similarity_under_bias(
             sim_balanced = rgsim.build_similarity(
                 model, calib_ids, run.dir / "sim_balanced",
                 max_tokens_per_layer=spec.max_tokens_per_layer or 100_000,
-                batch_size=spec.similarity_batch_size, device=None,
+                batch_size=spec.similarity_batch_size, device=spec.device,
                 progress=spec.progress,
             ).matrices
         report["recomputed"] = True

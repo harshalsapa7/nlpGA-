@@ -6,13 +6,14 @@ and writes a complete, parseable run directory.
 """
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from routerguard import cli, eval as rgeval, run as rgrun
+from routerguard import cli, eval as rgeval, pipeline, run as rgrun
 from routerguard.data import TokenSplit
 from routerguard.pipeline import PipelineSpec, run_balance_only, run_pipeline, run_similarity_only, run_stats_only
 from tests.conftest import build_model, make_ids
@@ -229,6 +230,29 @@ def test_run_similarity_only_caches_matrices(tmp_path):
     assert (sim_dir / "layer_00.npy").exists()
     assert (sim_dir / "layer_01.npy").exists()
     assert isinstance(out["recomputed_under_bias"], bool)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0", "cuda:1"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_similarity_passes_device_to_both_collections(tmp_path, monkeypatch, device, recompute):
+    """Check GPU call wiring even on CPU-only CI; don't mock the decision logic."""
+    calls = []
+
+    def build_similarity(model, ids, directory, **kwargs):
+        assert kwargs["device"] == device
+        calls.append(directory.name)
+        return SimpleNamespace(matrices={0: directory.name})
+
+    monkeypatch.setattr(pipeline.rgsim, "build_similarity", build_similarity)
+    monkeypatch.setattr(pipeline.rgbalance, "apply_bias", lambda *args, **kwargs: nullcontext())
+    before = {"per_layer_counts": {0: [10, 1]}}
+    after = {"per_layer_counts": {0: [1, 10]}} if recompute else before
+    _, _, report = pipeline._similarity_under_bias(
+        None, make_ids(), SimpleNamespace(dir=tmp_path),
+        PipelineSpec(device=device, progress=False), before, after, {},
+    )
+    assert calls == (["sim_unbalanced", "sim_balanced"] if recompute else ["sim_unbalanced"])
+    assert report["recomputed"] is recompute
 
 
 # ----------------------------------------------------------------------- CLI wiring
