@@ -17,6 +17,7 @@ from routerguard import cli, eval as rgeval, pipeline, run as rgrun
 from routerguard.data import TokenSplit
 from routerguard.pipeline import PipelineSpec, run_balance_only, run_pipeline, run_similarity_only, run_stats_only
 from tests.conftest import build_model, make_ids
+from tests.test_step3 import _CharTokenizer, _letter_prompts
 
 
 class _Info:
@@ -200,6 +201,61 @@ def test_kaggle_smoke_settings_complete_pipeline(tmp_path, device):
     assert summary["refit"] is None
     assert summary["merge"] is None
     assert (run_dir / "balance_biases.pt").is_file()
+
+
+def _full_eval_spec(tmp_path, monkeypatch, device="cpu"):
+    monkeypatch.setattr(pipeline.rgdata, "build_mmlu_prompts", lambda **kwargs: _letter_prompts())
+
+    def loader():
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        return (
+            build_model("olmoe").to(device=device, dtype=dtype),
+            _CharTokenizer(), SimpleNamespace(precision="fp16" if device.startswith("cuda") else "fp32"),
+        )
+
+    return _spec(
+        tmp_path, device=device, loader=loader, do_mmlu=True, do_throughput=True,
+        protocol=None, overrides={
+            "metrics": {"throughput": {"seq_len": 8, "warmup": 1, "runs": 2}},
+        },
+    )
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda:0", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="requires CUDA",
+    )),
+])
+def test_full_pipeline_including_mmlu_throughput_and_refit(tmp_path, monkeypatch, device):
+    """Don't disable the full-only arms in integration coverage."""
+    state = run_pipeline(_full_eval_spec(tmp_path, monkeypatch, device))
+    run_dir = Path(state["run_dir"])
+    metrics = json.loads((run_dir / "metrics/pruned_eval.json").read_text())
+    assert metrics["mmlu"]["n_questions"] == 4
+    assert len(metrics["throughput"]["seconds_per_run"]) == 2
+    assert metrics["throughput"]["seq_len"] == 8  # resolved overrides reach evaluation
+    assert metrics["perplexity"]["perplexity"] > 0
+    assert state["refit_ppl"] is not None
+    assert not any("failed" in note for note in state["notes"])
+    partial = json.loads((run_dir / "metrics/pruned_eval_partial.json").read_text())
+    assert partial == metrics
+
+
+def test_failed_throughput_retains_completed_mmlu_and_perplexity(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("throughput probe failed")
+
+    monkeypatch.setattr(rgeval, "throughput", fail)
+    with pytest.raises(RuntimeError, match="throughput probe failed"):
+        run_pipeline(_full_eval_spec(tmp_path, monkeypatch))
+    run_dir, = (tmp_path / "results").iterdir()
+    partial = json.loads((run_dir / "metrics/pruned_eval_partial.json").read_text())
+    assert partial["perplexity"]["perplexity"] > 0
+    assert partial["mmlu"]["n_questions"] == 4
+    assert "throughput" not in partial
+    assert not (run_dir / "metrics/pruned_eval.json").exists()
+    assert not (run_dir / "metrics/summary.json").exists()  # failure is not success
 
 
 # ------------------------------------------------------------------ stage commands

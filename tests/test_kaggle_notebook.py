@@ -173,6 +173,9 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIn("device='cuda:0'", self.cells["preflight"])
         self.assertIn("state = run_pipeline(PipelineSpec(", self.cells["preflight"])
         self.assertIn("TokenSplit('synthetic_calib'", self.cells["preflight"])
+        self.assertIn("with_refit=True", self.cells["preflight"])
+        self.assertIn("do_throughput=True", self.cells["preflight"])
+        self.assertIn("mmlu_batch_size=1, do_mmlu=True", self.cells["preflight"])
         self.assertNotIn("from_pretrained", self.cells["preflight"])
 
     def test_complete_tiny_preflight_program_offline_on_cpu(self):
@@ -181,7 +184,9 @@ class KaggleNotebookTests(unittest.TestCase):
         from transformers import OlmoeConfig, OlmoeForCausalLM
         from routerguard.balance import fit_biases
         from routerguard.data import TokenSplit
+        from routerguard.eval import evaluate_all
         from routerguard.pipeline import PipelineSpec, run_pipeline
+        from routerguard.run import load_protocol
 
         tree = ast.parse(self.cells["preflight"])
         program = next(
@@ -197,11 +202,15 @@ class KaggleNotebookTests(unittest.TestCase):
             "OlmoeConfig": OlmoeConfig, "OlmoeForCausalLM": OlmoeForCausalLM,
             "fit_biases": fit_biases, "TokenSplit": TokenSplit,
             "PipelineSpec": PipelineSpec, "run_pipeline": run_pipeline,
+            "evaluate_all": evaluate_all, "load_protocol": load_protocol,
         }
         with contextlib.redirect_stdout(io.StringIO()):
             exec(program, namespace)
         self.assertGreater(namespace["state"]["checkpoint_bytes_saved"], 0)
         self.assertEqual(namespace["fit"]["updates"], 2)
+        self.assertIsNotNone(namespace["state"]["refit_ppl"])
+        self.assertEqual(namespace["bundle"]["mmlu"]["n_questions"], 2)
+        self.assertEqual(namespace["bundle"]["throughput"]["runs"], 2)
 
     def test_experiment_gates(self):
         # Later cells remain safe if a user manually skips over a failed cell.

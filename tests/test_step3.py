@@ -333,6 +333,66 @@ def test_throughput_reports_variance(flavor):
     assert result["cv"] >= 0
 
 
+@pytest.mark.parametrize("device", [None, "cpu", "cuda:0", "cuda:1"])
+def test_throughput_rng_and_inputs_use_compatible_devices(monkeypatch, device):
+    """Catch CUDA RNG mismatches on CPU CI before another long Kaggle run."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    target = torch.device(device or "cpu")
+    forwards, syncs = [], []
+    randint = torch.randint
+
+    def checked_randint(*args, **kwargs):
+        allocation_device = torch.device(kwargs.get("device") or "cpu")
+        assert kwargs["generator"].device == allocation_device
+        return randint(*args, **kwargs)
+
+    class Model:
+        config = SimpleNamespace(vocab_size=128)
+
+        def __call__(self, input_ids, use_cache=False):
+            assert input_ids.device == target
+            assert input_ids.shape == (2, 8)
+            forwards.append(input_ids)
+
+    monkeypatch.setattr(torch, "randint", checked_randint)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: syncs.append(device))
+    with FakeTensorMode():
+        result = rgeval.throughput(
+            Model(), seq_len=8, batch_size=2, warmup=1, runs=2, device=device,
+        )
+    assert len(forwards) == 3
+    assert len(result["seconds_per_run"]) == 2
+    assert syncs == ([target] * 3 if target.type == "cuda" else [])
+
+
+def test_throughput_inputs_are_seeded_without_changing_global_rng():
+    class Model:
+        config = SimpleNamespace(vocab_size=128)
+
+        def __init__(self):
+            self.inputs = []
+
+        def __call__(self, input_ids, use_cache=False):
+            self.inputs.append(input_ids.clone())
+
+    before = torch.random.get_rng_state().clone()
+    model = Model()
+    for seed in (42, 42, 123):
+        rgeval.throughput(model, seq_len=8, warmup=0, runs=1, device="cpu", seed=seed)
+    assert torch.equal(model.inputs[0], model.inputs[1])
+    assert not torch.equal(model.inputs[0], model.inputs[2])
+    assert torch.equal(before, torch.random.get_rng_state())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_throughput_cuda(flavor):
+    model = build_model(flavor).to(device="cuda:0", dtype=torch.float16)
+    result = rgeval.throughput(model, seq_len=8, warmup=1, runs=2, device="cuda:0")
+    assert result["tokens_per_sec_mean"] > 0
+    assert len(result["seconds_per_run"]) == 2
+
+
 def test_evaluate_all_bundle(flavor):
     model = build_model(flavor)
     tokenizer = _CharTokenizer()

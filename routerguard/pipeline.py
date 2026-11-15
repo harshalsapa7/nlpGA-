@@ -168,23 +168,29 @@ def _device(spec: PipelineSpec):
 
 def _ppl(model, eval_ids, spec: PipelineSpec, device=None) -> dict[str, Any]:
     return rgeval.wikitext_perplexity(
-        model, eval_ids, batch_size=spec.ppl_batch_size, device=_device(spec)
+        model, eval_ids, batch_size=spec.ppl_batch_size, device=_device(spec),
+        progress=spec.progress,
     )
 
 
-def _eval_bundle(model, tokenizer, eval_ids, prompts, spec: PipelineSpec, precision: str) -> dict[str, Any]:
+def _eval_bundle(
+    model, tokenizer, eval_ids, prompts, spec: PipelineSpec, precision: str,
+    protocol: dict[str, Any], run: rgrun.Run,
+) -> dict[str, Any]:
     return rgeval.evaluate_all(
         model,
         tokenizer,
         eval_ids=eval_ids,
         prompts=prompts,
-        protocol=spec.protocol or {},
+        protocol=protocol,
         precision=precision,
         device=spec.device if torch.cuda.is_available() else None,
         batch_size=spec.ppl_batch_size,
         mmlu_batch_size=spec.mmlu_batch_size,
         do_mmlu=prompts is not None,
-        do_throughput=spec.do_throughput and torch.cuda.is_available(),
+        do_throughput=spec.do_throughput,
+        progress=spec.progress,
+        on_metric=lambda metrics: run.save_json("pruned_eval_partial", metrics),
     )
 
 
@@ -270,6 +276,8 @@ def run_ablation(
             if ranking == "random":
                 for seed in spec.resolved_seeds(protocol):
                     for ratio in spec.resolved_ratios(protocol):
+                        if spec.progress:
+                            print(f"[ablation] {router_state} random seed={seed} ratio={ratio}", flush=True)
                         keeps = prune.keeps_for(model, "random", ratio, seed=seed)
                         with torch.no_grad(), moe.MaskSim(model, keeps, bias=bias):
                             ppl = _ppl(model, eval_ids, spec)
@@ -278,6 +286,8 @@ def run_ablation(
                         cells.append(_cell(router_state, label, ratio, ppl, baseline_ppl, keeps, layer_budget=False))
             elif ranking in ("frequency", "redundancy"):
                 for ratio in spec.resolved_ratios(protocol):
+                    if spec.progress:
+                        print(f"[ablation] {router_state} {ranking} ratio={ratio}", flush=True)
                     eff_ratio = _ratio_for(spec, ranking, ratio, sim)
                     keeps = prune.keeps_for(
                         model, ranking, eff_ratio,
@@ -426,7 +436,7 @@ def run_pipeline(spec: PipelineSpec) -> dict[str, Any]:
     run.save_json("pruned_removal", {**removal, "ranking": ranking, "ratio": materialize_ratio,
                                      "layer_budget": isinstance(eff_ratio, dict)})
 
-    bundle = _eval_bundle(model, tokenizer, eval_ids, prompts, spec, precision)
+    bundle = _eval_bundle(model, tokenizer, eval_ids, prompts, spec, precision, protocol, run)
     run.save_json("pruned_eval", bundle)
     ppl_pruned = bundle["perplexity"]["perplexity"]
 

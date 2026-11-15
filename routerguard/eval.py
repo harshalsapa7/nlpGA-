@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import statistics
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -253,25 +253,29 @@ def throughput(
     warmup: int = 5,
     runs: int = 10,
     batch_size: int = 1,
-    device: str = "cuda",
+    device: str | torch.device | None = "cuda",
     seed: int = 0,
 ) -> dict[str, Any]:
     """Tokens/sec with multi-run variance; secondary metric, so report the spread."""
-    generator = torch.Generator().manual_seed(seed)
+    # Generate once on CPU with its own RNG, then transfer outside the timed loop.
+    # A CPU generator cannot be passed to a CUDA torch.randint allocation.
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     vocab = int(getattr(model.config, "vocab_size", 32000))
-    input_ids = torch.randint(0, min(vocab, 30000), (batch_size, seq_len), generator=generator, device=device)
+    input_ids = torch.randint(
+        0, min(vocab, 30000), (batch_size, seq_len), generator=generator, device="cpu",
+    ).to(device)
 
     for _ in range(warmup):
         model(input_ids=input_ids, use_cache=False)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if input_ids.is_cuda:
+        torch.cuda.synchronize(input_ids.device)
 
     times: list[float] = []
     for _ in range(runs):
         start = time.perf_counter()
         model(input_ids=input_ids, use_cache=False)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
         times.append(time.perf_counter() - start)
 
     tokens = seq_len * batch_size
@@ -306,18 +310,37 @@ def evaluate_all(
     mmlu_batch_size: int = 8,
     do_mmlu: bool = True,
     do_throughput: bool = True,
+    progress: bool = False,
+    on_metric: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """One call for a full evaluation point (used by notebook 02's curve)."""
+    """Full evaluation; optionally persist each completed metric before the next."""
     metrics: dict[str, Any] = {"params": param_report(model, precision)}
     cfg = (protocol or {}).get("metrics", {})
 
+    def save_partial():
+        if on_metric is not None:
+            on_metric(dict(metrics))
+
+    save_partial()
     if eval_ids is not None:
-        metrics["perplexity"] = wikitext_perplexity(model, eval_ids, batch_size=batch_size, device=device)
+        if progress:
+            print("[eval] perplexity", flush=True)
+        metrics["perplexity"] = wikitext_perplexity(
+            model, eval_ids, batch_size=batch_size, device=device, progress=progress,
+        )
+        save_partial()
     if prompts is not None and do_mmlu:
-        mmlu = mmlu_accuracy(model, tokenizer, prompts, batch_size=mmlu_batch_size, device=device)
+        if progress:
+            print("[eval] MMLU", flush=True)
+        mmlu = mmlu_accuracy(
+            model, tokenizer, prompts, batch_size=mmlu_batch_size, device=device, progress=progress,
+        )
         mmlu.pop("predictions", None)
         metrics["mmlu"] = mmlu
+        save_partial()
     if do_throughput:
+        if progress:
+            print("[eval] throughput", flush=True)
         runner = cfg.get("throughput", {})
         metrics["throughput"] = throughput(
             model,
@@ -326,5 +349,7 @@ def evaluate_all(
             runs=int(runner.get("runs", 10)),
             device=device,
         )
+        save_partial()
     metrics["memory"] = memory_snapshot()
+    save_partial()
     return metrics
